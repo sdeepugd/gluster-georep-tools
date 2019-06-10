@@ -470,7 +470,7 @@ def create_georep_session(args, slaveuser, slavehost, slavevol):
            args.mastervol,
            "{0}::{1}".format(slave, slavevol),
            "create",
-           "no-verify"]
+           "push-pem"]
 
     cmd += ["force"] if args.force else []
     execute(cmd,
@@ -579,19 +579,6 @@ def setup_georep():
 
     # Run gsec_create command
     run_gsec_create(georep_dir)
-
-    # Target name for Pubfile
-    pubfile = "{mastervol}_{slavevol}_common_secret.pem.pub".format(
-        mastervol=args.mastervol, slavevol=slavevol)
-
-    # Copy Pub file to Main Slave node
-    #copy_to_main_slave_node(ssh, args, slavehost, georep_dir, pubfile)
-
-    # Distribute SSH Keys to All the Slave nodes
-    #distribute_to_all_slave_nodes(ssh, pubfile)
-
-    # Add the SSH Keys to authorized_keys file of all Slave nodes
-    #add_to_authorized_keys(ssh, pubfile, slaveuser)
 
     # Create Geo-rep Session
     create_georep_session(args, slaveuser, slavehost, slavevol)
