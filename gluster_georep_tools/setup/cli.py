@@ -26,7 +26,10 @@ SESSION_MOUNT_LOG_FILE = ("/var/log/glusterfs/geo-replication"
 SYMBOLS = ('K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y')
 DEFAULT_GLUSTERD_WORKDIR = "/var/lib/glusterd"
 USE_CLI_COLOR = True
-
+DEFAULT_GLUSTER_EXEC="gluster"
+DEFAULT_GLUSTERFS_EXEC="glusterfs"
+BRICK_REGEX="Brick\ ([0-9]{3}\.[0-9]{3}\.[0-9]{3}\.[0-9]{3}):.*"
+SLAVE_PASSWD=""
 
 class COLORS:
     """
@@ -72,7 +75,7 @@ def cleanup(hostname, volname, mnt):
     """
     Unmount the Volume and Remove the temporary directory
     """
-    execute(["umount", mnt],
+    execute(["sudo","umount", mnt],
             failure_msg="Unable to Unmount Gluster Volume "
             "{0}:{1}(Mounted at {2})".format(hostname, volname, mnt))
     execute(["rmdir", mnt],
@@ -89,8 +92,9 @@ def glustermount(hostname, volname):
             # Do your stuff
     Automatically unmounts it in case of Exceptions/out of context
     """
+    global DEFAULT_GLUSTERFS_EXEC
     mnt = tempfile.mkdtemp(prefix="georepsetup_")
-    execute(["glusterfs",
+    execute(["sudo",DEFAULT_GLUSTERFS_EXEC,
              "--xlator-option=\"*dht.lookup-unhashed=off\"",
              "--volfile-server", hostname,
              "--volfile-id", volname,
@@ -139,7 +143,7 @@ def color_txt(txt, color):
 
 def output_ok(msg):
     """
-    Success Message handler.
+    OSuccess Message handler.
     """
     pfx = color_txt("[    OK]", COLORS.GREEN) if USE_CLI_COLOR else "[    OK]"
     sys.stdout.write("%s %s\n" % (pfx, msg))
@@ -168,6 +172,7 @@ def execute(cmd, success_msg="", failure_msg="", exitcode=-1):
     On success it can print message in stdout if specified.
     On failure, exits after writing to stderr.
     """
+    #sys.stdout.write("Command executed in localhost:"+str(cmd))
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = p.communicate()
     if p.returncode == 0:
@@ -205,14 +210,27 @@ def check_host_reachable(slavehost):
         output_notok("{0} is Not Reachable(Port 22)".format(slavehost))
 
 
-def ssh_initialize(slavehost, passwd):
+def generate_ssh_key(slaveuser,slavehost,passwd):
+    from os import chmod
+    from Crypto.PublicKey import RSA
+
+    key=RSA.generate("2048")
+    with open("/tmp/private.key",'wb') as content_file:
+        chmod("/tmp/private.key",0600)
+        content_file.write(key.exportKey('PEM'))
+    pubfile=key.publickey()
+    with open("/tmp/public.key",'wb') as content_file:
+        content_file.write(pubfile.exportKey("OpenSSH"))
+
+
+def ssh_initialize(slaveuser,slavehost, passwd):
     """
     Initialize the SSH connection
     """
     ssh = paramiko.SSHClient()
     try:
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(slavehost, username="root", password=passwd)
+        ssh.connect(slavehost, username=slaveuser, password=passwd)
         output_ok("SSH Connection established root@{0}".format(slavehost))
     except paramiko.ssh_exception.AuthenticationException as e:
         output_notok("Unable to establish SSH connection "
@@ -226,14 +244,15 @@ def compare_gluster_versions(ssh):
     Collect Master version by directly executing CLI command, get Slave version
     via SSH command execution
     """
+    global DEFAULT_GLUSTER_EXEC
     # Collect Gluster Version from Master
-    master_version = execute(["gluster", "--version"],
+    master_version = execute(["sudo",DEFAULT_GLUSTER_EXEC, "--version"],
                              failure_msg="Failed to get Gluster version "
                              "from Master")
     master_version = master_version.split()[1]
 
     # Collect Gluster Version from Slave
-    stdin, stdout, stderr = ssh.exec_command("gluster --version")
+    stdin, stdout, stderr = ssh.exec_command("sudo "+DEFAULT_GLUSTER_EXEC+" --version")
     rc = stdout.channel.recv_exit_status()
     if rc != 0:
         output_notok("Unable to get Slave Gluster Version")
@@ -321,13 +340,56 @@ def compare_disk_sizes(args, slavehost, slavevol):
         else:
             output_warning(msg)
 
+def setup_slave_mountbroker(ssh,slaveuser,slavevolume):
+    stdin,stdout,stderr = ssh.exec_command("sudo"+" gluster-mountbroker"" setup"+" /var/mountbroker-root "+slaveuser)
+    #print("type of stdin: "+str(type(stdin))+" and dir: " +str(dir(stdin)))
+    rc=stdout.channel.recv_exit_status()
+    if rc is 0:
+        output_ok("mountbroker setup sucess on slave")
+        stdin,stdout,stderr = ssh.exec_command("sudo"+"  gluster-mountbroker"+" add "+slavevolume+" "+slaveuser)
+        rc=stdout.channel.recv_exit_status()
+        if rc is 0:
+            output_ok("mountbroker added user and slave")
+        else:
+            output_notok("mountbroker user add failed")
+    else:
+        output_notok("mountbroker not setup on slave")
+
+def restart_slave_daemon(node,slaveuser):
+    global SLAVE_PASSWD
+    ssh=paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(node,username=slaveuser,password=SLAVE_PASSWD)
+    stdin,stdout,stderr=ssh.exec_command("sudo systemctl stop glusterd; sudo systemctl start glusterd")
+    rc=stdout.channel.recv_exit_status()
+    if rc is 0:
+        output_ok("glusterd restarted in node:"+node)
+    else:
+        output_notok("glusterd not restarted in node:"+node)
+
+
+def restart_all_slave_daemon(ssh,slaveuser,slavevol):
+    import re
+    global BRICK_REGEX
+    stdin,stdout,stderr=ssh.exec_command("sudo gluster volume status "+slavevol+" detail")
+    rc=stdout.channel.recv_exit_status()
+    slave_nodes=[]
+    if rc is 0:
+        out="".join(stdout.readlines())
+        matches=re.finditer(BRICK_REGEX,out,re.MULTILINE)
+        for matchNum,match in enumerate(matches,start=1):
+            node=match.group(1)
+            restart_slave_daemon(node,slaveuser)
+    else:
+         output_notok("cannot get slave nodes' details")
 
 def run_gsec_create(georep_dir):
     """
     gsec_create command to generate pem keys in all the master nodes
     and collect all pub keys to single node
     """
-    execute(["gluster", "system::", "execute", "gsec_create"],
+    global DEFAULT_GLUSTER_EXEC
+    execute(["sudo",DEFAULT_GLUSTER_EXEC, "system::", "execute", "gsec_create"],
             success_msg="Common secret pub file present at "
             "{0}/common_secret.pem.pub".format(georep_dir),
             failure_msg="Common secret pub file generation failed")
@@ -351,8 +413,9 @@ def distribute_to_all_slave_nodes(ssh, pubfile):
     Distribute the pem.pub file to all the slave nodes using
     Glusterd copy file infrastructure
     """
+    global DEFAULT_GLUSTER_EXEC
     stdin, stdout, stderr = ssh.exec_command(
-        "gluster system:: copy file /geo-replication/{pubfile}".format(
+        "sudo "+DEFAULT_GLUSTER_EXEC+" system:: copy file /geo-replication/{pubfile}".format(
             pubfile=pubfile))
 
     rc = stdout.channel.recv_exit_status()
@@ -368,8 +431,9 @@ def add_to_authorized_keys(ssh, pubfile, slaveuser):
     """
     Add these pub keys to authorized_keys file of all Slave nodes
     """
+    global DEFAULT_GLUSTER_EXEC
     stdin, stdout, stderr = ssh.exec_command(
-        "gluster system:: execute add_secret_pub {slaveuser} "
+        "sudo "+DEFAULT_GLUSTER_EXEC+" system:: execute add_secret_pub {slaveuser} "
         "geo-replication/{pubfile}".format(
             pubfile=pubfile, slaveuser=slaveuser))
 
@@ -381,16 +445,28 @@ def add_to_authorized_keys(ssh, pubfile, slaveuser):
         output_notok("Unable to update Master SSH Keys to all "
                      "Up Slave nodes authorized_keys file")
 
+def collect_slave_keys(ssh, slaveuser, mastervol, slavevol):
+    global DEFAULT_GLUSTER_EXEC
+    stdin, stdout, stderr = ssh.exec_command("sudo sh /usr/libexec/glusterfs/set_geo_rep_pem_keys.sh "+slaveuser+" "+mastervol+" "+slavevol)
+    rc = stdout.channel.recv_exit_status()
+    if rc == 0:
+        output_ok("Collect slave keys ")
+    else:
+        out=stderr.readlines()
+        output_notok("Unable to collect keys "+str(out))
+
+
 
 def create_georep_session(args, slaveuser, slavehost, slavevol):
     """
     Create Geo-rep session using gluster volume geo-replication command
     """
+    global DEFAULT_GLUSTER_EXEC
     slave = slavehost
     if slaveuser != "root":
         slave = "{0}@{1}".format(slaveuser, slavehost)
 
-    cmd = ["gluster", "volume", "geo-replication",
+    cmd = ["sudo",DEFAULT_GLUSTER_EXEC, "volume", "geo-replication",
            args.mastervol,
            "{0}::{1}".format(slave, slavevol),
            "create",
@@ -400,6 +476,41 @@ def create_georep_session(args, slaveuser, slavehost, slavevol):
     execute(cmd,
             success_msg="Geo-replication Session Established",
             failure_msg="Failed to Establish Geo-replication Session")
+
+def config_georep_session(args, slaveuser, slavehost, slavevol):
+    """
+    Create Geo-rep session using gluster volume geo-replication command
+    """
+    global DEFAULT_GLUSTER_EXEC
+    slave = slavehost
+    if slaveuser != "root":
+        slave = "{0}@{1}".format(slaveuser, slavehost)
+    cmd = ["sudo",DEFAULT_GLUSTER_EXEC, "volume", "geo-replication",
+           args.mastervol,
+           "{0}::{1}".format(slave, slavevol),
+           "config","remote-gsyncd","/usr/libexec/glusterfs/gsyncd"]
+    execute(cmd,
+            success_msg="Geo-replication Config success",
+            failure_msg="Failed to Config  Geo-replication Session")
+
+def start_georep_session(args, slaveuser, slavehost, slavevol):
+    """
+    Create Geo-rep session using gluster volume geo-replication command
+    """
+    global DEFAULT_GLUSTER_EXEC
+    slave = slavehost
+    if slaveuser != "root":
+        slave = "{0}@{1}".format(slaveuser, slavehost)
+
+    cmd = ["sudo",DEFAULT_GLUSTER_EXEC, "volume", "geo-replication",
+           args.mastervol,
+           "{0}::{1}".format(slave, slavevol),
+           "start"]
+
+    execute(cmd,
+            success_msg="Geo-replication Start success",
+            failure_msg="Failed to Start Geo-replication Session")
+
 
 
 def setup_georep():
@@ -439,18 +550,19 @@ def setup_georep():
                          "between {mastervol} and {slave}\n"
                          "Root password of {slavehost} is required to complete"
                          " the setup. NOTE: Password will not be stored.\n\n"
-                         "root@{slavehost}'s password: ".format(
+                         "<slaveuser>@{slavehost}'s password: ".format(
                              mastervol=args.mastervol,
                              slave=args.slave,
                              slavehost=slavehost))
-
-    passwd = getpass.getpass(passwd_prompt_msg)
+    mastervol=args.mastervol
+    global SLAVE_PASSWD
+    passwd = SLAVE_PASSWD#getpass.getpass(passwd_prompt_msg)
 
     # SSH Port check: Enabled/Disabled
     check_host_reachable(slavehost)
 
     # Initiate SSH Client
-    ssh = ssh_initialize(slavehost, passwd)
+    ssh = ssh_initialize(slaveuser,slavehost, passwd)
 
     # Compare Gluster Version in Master Cluster and Slave Cluster
     compare_gluster_versions(ssh)
@@ -458,6 +570,12 @@ def setup_georep():
     # Compare disk size and used size to decide Master and Slave are compatible
     # Also check if Slave is empty or not
     compare_disk_sizes(args, slavehost, slavevol)
+
+    #Setup mountbroker on slave
+    setup_slave_mountbroker(ssh,slaveuser,slavevol)
+
+    #restart Gluster Deamon on all slvae machine
+    restart_all_slave_daemon(ssh,slaveuser,slavevol)
 
     # Run gsec_create command
     run_gsec_create(georep_dir)
@@ -467,17 +585,25 @@ def setup_georep():
         mastervol=args.mastervol, slavevol=slavevol)
 
     # Copy Pub file to Main Slave node
-    copy_to_main_slave_node(ssh, args, slavehost, georep_dir, pubfile)
+    #copy_to_main_slave_node(ssh, args, slavehost, georep_dir, pubfile)
 
     # Distribute SSH Keys to All the Slave nodes
-    distribute_to_all_slave_nodes(ssh, pubfile)
+    #distribute_to_all_slave_nodes(ssh, pubfile)
 
     # Add the SSH Keys to authorized_keys file of all Slave nodes
-    add_to_authorized_keys(ssh, pubfile, slaveuser)
+    #add_to_authorized_keys(ssh, pubfile, slaveuser)
 
-    # Last Step: Create Geo-rep Session
+    # Create Geo-rep Session
     create_georep_session(args, slaveuser, slavehost, slavevol)
 
+    #collecting ssh keys
+    collect_slave_keys(ssh, slaveuser, mastervol, slavevol)
+
+    #config geo sessiong with remote-gsyncd
+    config_georep_session(args, slaveuser, slavehost, slavevol)
+
+    #start geo replication session
+    start_georep_session(args, slaveuser, slavehost, slavevol)
 
 def get_args():
     """
