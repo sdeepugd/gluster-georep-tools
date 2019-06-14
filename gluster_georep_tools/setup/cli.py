@@ -41,6 +41,9 @@ class COLORS:
     NOCOLOR = "\033[0m"
 
 
+self.masters
+self.slaves
+
 def human_readable_size(num):
     """
     To show size as 100K, 100M, 10G instead of
@@ -528,10 +531,10 @@ def setup_georep():
     10. Create Geo-replication Session
     """
     # Parse/Validate the CLI arguments
+    global SLAVE_PASSWD
+    passwd=raw_input("Enter the slave passwd")
+    SLAVE_PASSWD=passwd
     args = get_args()
-
-    if os.getuid() != 0:
-        output_notok("Only root can run this tool!")
 
     # Modify the Global Config based on User input. If no coloring required
     global USE_CLI_COLOR
